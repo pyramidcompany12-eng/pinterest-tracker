@@ -80,7 +80,7 @@ function Icon({ name, className = "w-5 h-5", strokeWidth = 2 }) {
   return <span ref={ref} className={"inline-flex " + className}></span>;
 }
 
-// -------- Storage (Supabase + localStorage cache) ----------
+// -------- Storage (Supabase normalized tables + localStorage cache) ----------
 const SUPABASE_URL = "https://nwajeeezidtwpvpjbklz.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im53YWplZWV6aWR0d3B2cGpia2x6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2OTEyMjEsImV4cCI6MjA5NDI2NzIyMX0.Ykvvd0_YKCdWqDfZjixcnSmUnj3lv9ZKWMw6Lu_zHaw";
 const sb = window.supabase && window.supabase.createClient
@@ -93,17 +93,65 @@ const loadLocal = () => {
 };
 const saveLocal = (s) => localStorage.setItem(LS_KEY, JSON.stringify(s));
 
-async function loadCloud() {
+// camelCase <-> snake_case mapping for accounts
+const accToDb = (a) => ({
+  id: a.id, username: a.username, display_name: a.displayName,
+  gmail: a.gmail || null, password: a.password || null, niche: a.niche || null,
+  avatar_color: a.avatarColor, followers: a.followers|0, following: a.following|0,
+  monthly_views: a.monthlyViews|0, pins: a.pins|0, boards: a.boards|0,
+  notes: a.notes || "", tasks: a.tasks || [], history: a.history || [],
+  last_update: a.lastUpdate ? new Date(a.lastUpdate).toISOString() : new Date().toISOString()
+});
+const accFromDb = (r) => ({
+  id: r.id, username: r.username, displayName: r.display_name || r.username,
+  gmail: r.gmail || "", password: r.password || "", niche: r.niche || "",
+  avatarColor: r.avatar_color || "#e60023",
+  followers: r.followers|0, following: r.following|0, monthlyViews: r.monthly_views|0,
+  pins: r.pins|0, boards: r.boards|0, notes: r.notes || "",
+  tasks: r.tasks || [], history: r.history || [],
+  lastUpdate: r.last_update ? new Date(r.last_update).getTime() : Date.now()
+});
+
+async function loadAll() {
   if (!sb) return null;
-  const { data, error } = await sb.from("app_state").select("data").eq("id", 1).single();
-  if (error) { console.warn("[supabase load]", error); return null; }
-  return data && data.data && Object.keys(data.data).length ? data.data : null;
+  try {
+    const [accs, brahma, weight, settings] = await Promise.all([
+      sb.from('accounts').select('*').order('created_at', { ascending: true }),
+      sb.from('brahma_entries').select('*'),
+      sb.from('weight_entries').select('*'),
+      sb.from('settings').select('*'),
+    ]);
+    if (accs.error) throw accs.error;
+    if (brahma.error) throw brahma.error;
+    if (weight.error) throw weight.error;
+    if (settings.error) throw settings.error;
+    const settingsMap = Object.fromEntries((settings.data||[]).map(s => [s.key, s.value]));
+    return {
+      accounts: (accs.data || []).map(accFromDb),
+      brahma: {
+        entries: Object.fromEntries((brahma.data||[]).map(e => [e.day, { status: e.status, count: e.count|0, note: e.note || "" }]))
+      },
+      weight: {
+        target: settingsMap.weight_target ?? 60,
+        entries: Object.fromEntries((weight.data||[]).map(e => [e.day, { morning: e.morning ?? "", evening: e.evening ?? "", note: e.note || "" }]))
+      }
+    };
+  } catch (e) {
+    console.error("[supabase loadAll]", e);
+    return null;
+  }
 }
-async function saveCloud(state) {
-  if (!sb) return;
-  const { error } = await sb.from("app_state").upsert({ id: 1, data: state, updated_at: new Date().toISOString() });
-  if (error) console.warn("[supabase save]", error);
-}
+
+// Per-entity writers
+const cloud = {
+  upsertAccount: (a) => sb && sb.from('accounts').upsert(accToDb(a)),
+  deleteAccount: (id) => sb && sb.from('accounts').delete().eq('id', id),
+  upsertBrahma: (day, e) => sb && sb.from('brahma_entries').upsert({ day, status: e.status||'clean', count: e.count|0, note: e.note||'', updated_at: new Date().toISOString() }),
+  deleteBrahma: (day) => sb && sb.from('brahma_entries').delete().eq('day', day),
+  upsertWeight: (day, e) => sb && sb.from('weight_entries').upsert({ day, morning: e.morning===""?null:Number(e.morning), evening: e.evening===""?null:Number(e.evening), note: e.note||'', updated_at: new Date().toISOString() }),
+  deleteWeight: (day) => sb && sb.from('weight_entries').delete().eq('day', day),
+  setSetting: (key, value) => sb && sb.from('settings').upsert({ key, value, updated_at: new Date().toISOString() }),
+};
 
 const seed = () => ({
   brahma: { entries: {} }, // { 'YYYY-MM-DD': { status:'clean'|'slip', count:number, note:string } }
@@ -247,62 +295,74 @@ function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [tick, setTick] = useState(0);
   const [showDream, setShowDream] = useState(true);
-  const [cloudStatus, setCloudStatus] = useState("loading"); // loading | synced | error | offline
-  const skipNextSave = useRef(false);
-  const saveTimer = useRef(null);
+  const [cloudStatus, setCloudStatus] = useState("loading"); // loading | synced | saving | offline
 
-  // Initial cloud load
+  // helper: track a cloud write (so the sidebar shows "Saving…" → "synced")
+  const track = async (promise) => {
+    if (!sb || !promise) return;
+    setCloudStatus("saving");
+    try { const r = await promise; if (r && r.error) throw r.error; setCloudStatus("synced"); }
+    catch (e) { console.warn("[cloud write]", e); setCloudStatus("synced"); }
+  };
+
+  // Reload all data from cloud
+  const refresh = async () => {
+    if (!sb) { setCloudStatus("offline"); return; }
+    setCloudStatus("loading");
+    const next = await loadAll();
+    if (next) {
+      setState(next);
+      setActiveId(prev => prev || next.accounts[0]?.id || null);
+      saveLocal(next);
+      setCloudStatus("synced");
+    } else {
+      setCloudStatus("offline");
+    }
+  };
+
+  // Initial load + seed if empty
   useEffect(() => {
-    let alive = true;
     (async () => {
       if (!sb) { setCloudStatus("offline"); return; }
-      const cloud = await loadCloud();
-      if (!alive) return;
-      if (cloud && cloud.accounts) {
-        skipNextSave.current = true; // don't echo back what we just loaded
-        setState(cloud);
-        setActiveId(cloud.accounts[0]?.id || null);
+      const next = await loadAll();
+      if (next && next.accounts.length === 0 && Object.keys(next.brahma.entries).length === 0) {
+        // empty cloud — push local seed accounts up so user has something
+        const local = loadLocal();
+        if (local && local.accounts && local.accounts.length) {
+          for (const a of local.accounts) await cloud.upsertAccount(a);
+          await refresh();
+          return;
+        }
+      }
+      if (next) {
+        setState(next);
+        setActiveId(next.accounts[0]?.id || null);
+        saveLocal(next);
         setCloudStatus("synced");
       } else {
-        // first time — push current local state up
-        const cur = loadLocal() || seed();
-        await saveCloud(cur);
-        setCloudStatus("synced");
+        setCloudStatus("offline");
       }
     })();
-    return () => { alive = false; };
   }, []);
 
-  // Realtime subscription — pick up changes from other devices
+  // Realtime — any change in any table → refresh
   useEffect(() => {
     if (!sb) return;
-    const ch = sb.channel("app_state_changes")
-      .on("postgres_changes", { event: "*", schema: "public", table: "app_state" }, (payload) => {
-        const next = payload.new && payload.new.data;
-        if (!next) return;
-        // Only apply if it differs (avoid loop)
-        setState(prev => {
-          if (JSON.stringify(prev) === JSON.stringify(next)) return prev;
-          skipNextSave.current = true;
-          return next;
-        });
-      })
-      .subscribe();
-    return () => { sb.removeChannel(ch); };
+    const tables = ['accounts','brahma_entries','weight_entries','settings'];
+    const channels = tables.map(t =>
+      sb.channel("rt_"+t)
+        .on("postgres_changes", { event: "*", schema: "public", table: t }, () => {
+          // small debounce so a burst of changes does one refresh
+          clearTimeout(window.__pv_rt_t);
+          window.__pv_rt_t = setTimeout(refresh, 400);
+        })
+        .subscribe()
+    );
+    return () => { channels.forEach(c => sb.removeChannel(c)); };
   }, []);
 
-  // Save: local instantly, cloud debounced
-  useEffect(() => {
-    saveLocal(state);
-    if (skipNextSave.current) { skipNextSave.current = false; return; }
-    if (!sb) return;
-    setCloudStatus("saving");
-    clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      await saveCloud(state);
-      setCloudStatus("synced");
-    }, 800);
-  }, [state]);
+  // Local cache — write on every state change
+  useEffect(() => { saveLocal(state); }, [state]);
 
   // live "tick" for UI timestamps (no data mutation — real data now comes from cloud + manual logs)
   useEffect(() => {
@@ -353,15 +413,25 @@ function App() {
     setState(s => ({...s, accounts:[...s.accounts, a]}));
     setActiveId(a.id);
     setShowAdd(false);
+    track(cloud.upsertAccount(a));
   };
 
   const deleteAccount = (id) => {
     if (!confirm("Delete this account and all its tasks?")) return;
     setState(s => ({...s, accounts: s.accounts.filter(a=>a.id!==id)}));
+    track(cloud.deleteAccount(id));
   };
 
   const updateAccount = (id, patch) => {
-    setState(s => ({...s, accounts: s.accounts.map(a=>a.id===id?{...a,...patch}:a)}));
+    let updated = null;
+    setState(s => {
+      const accounts = s.accounts.map(a => {
+        if (a.id === id) { updated = { ...a, ...patch }; return updated; }
+        return a;
+      });
+      return { ...s, accounts };
+    });
+    if (updated) track(cloud.upsertAccount(updated));
   };
 
   const addTask = (accId, title) => {
@@ -408,12 +478,15 @@ function App() {
   // Brahmacharya diary handlers
   const brahma = state.brahma || { entries: {} };
   const setBrahmaEntry = (iso, patch) => {
+    let saved = null;
     setState(s => {
       const b = s.brahma || { entries: {} };
       const cur = b.entries[iso] || { status: "clean", count: 0, note: "" };
       const next = { ...cur, ...patch };
+      saved = next;
       return { ...s, brahma: { ...b, entries: { ...b.entries, [iso]: next } } };
     });
+    if (saved) track(cloud.upsertBrahma(iso, saved));
   };
   const clearBrahmaEntry = (iso) => {
     setState(s => {
@@ -421,16 +494,20 @@ function App() {
       const e = { ...b.entries }; delete e[iso];
       return { ...s, brahma: { ...b, entries: e } };
     });
+    track(cloud.deleteBrahma(iso));
   };
 
   // Weight handlers
   const weight = state.weight || { target: 60, entries: {} };
   const setWeightEntry = (iso, patch) => {
+    let saved = null;
     setState(s => {
       const w = s.weight || { target: 60, entries: {} };
       const cur = w.entries[iso] || { morning: "", evening: "", note: "" };
-      return { ...s, weight: { ...w, entries: { ...w.entries, [iso]: { ...cur, ...patch } } } };
+      saved = { ...cur, ...patch };
+      return { ...s, weight: { ...w, entries: { ...w.entries, [iso]: saved } } };
     });
+    if (saved) track(cloud.upsertWeight(iso, saved));
   };
   const clearWeightEntry = (iso) => {
     setState(s => {
@@ -438,9 +515,12 @@ function App() {
       const e = { ...w.entries }; delete e[iso];
       return { ...s, weight: { ...w, entries: e } };
     });
+    track(cloud.deleteWeight(iso));
   };
   const setWeightTarget = (n) => {
-    setState(s => ({ ...s, weight: { ...(s.weight||{entries:{}}), target: Number(n)||60 } }));
+    const t = Number(n) || 60;
+    setState(s => ({ ...s, weight: { ...(s.weight||{entries:{}}), target: t } }));
+    track(cloud.setSetting('weight_target', t));
   };
 
   if (showDream) return <DreamScreen onEnter={()=>setShowDream(false)}/>;
